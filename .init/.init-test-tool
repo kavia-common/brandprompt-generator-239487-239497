@@ -1,0 +1,4 @@
+{
+    "command": "npm run test",
+    "working_directory": "/home/kavia/workspace/code-generation/brandprompt-generator-239487-239497/prompt_extension_frontend"
+}
