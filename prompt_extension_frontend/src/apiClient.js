@@ -19,7 +19,14 @@ const DEFAULT_BASE_URL = "http://localhost:3001";
 function inferBackendUrlFromWindowLocation() {
   if (typeof window === "undefined") return null;
 
-  const { hostname, protocol } = window.location;
+  const { hostname, protocol, origin } = window.location;
+
+  // Extension popup context:
+  // window.location.hostname is often empty and origin is chrome-extension://<id>
+  // In that case, localhost is the best default unless user overrides.
+  if (typeof origin === "string" && origin.startsWith("chrome-extension://")) {
+    return DEFAULT_BASE_URL;
+  }
 
   // CRA dev server: default backend is localhost
   if (hostname === "localhost" || hostname === "127.0.0.1") {
