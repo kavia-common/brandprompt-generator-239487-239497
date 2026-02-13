@@ -1,7 +1,13 @@
 import React, { useEffect, useMemo, useState } from "react";
 import "./App.css";
 import { loadSettings, saveSettings } from "./storage";
-import { healthCheck, resolveBaseUrl } from "./apiClient";
+import {
+  generatePrompt,
+  getDefaultSettings,
+  getPublicConfig,
+  healthCheck,
+  resolveBaseUrl,
+} from "./apiClient";
 
 const TABS = [
   { id: "prompt", label: "Prompt" },
@@ -10,9 +16,10 @@ const TABS = [
 ];
 
 const DEFAULT_SETTINGS = {
+  // Users can override this; resolveBaseUrl() also has heuristics.
   backendBaseUrl: "http://localhost:3001",
 
-  // Prompt settings
+  // Prompt settings (UI)
   orientation: "Post",
   platform: "LinkedIn",
   objective: "Awareness",
@@ -20,7 +27,7 @@ const DEFAULT_SETTINGS = {
   topic: "",
   context: "",
 
-  // Brand settings
+  // Brand settings (UI)
   brandName: "",
   brandVoice: "Clear, confident, helpful",
   brandDo: "Use concise sentences. Be specific. Keep it practical.",
@@ -35,7 +42,7 @@ const DEFAULT_SETTINGS = {
  * - Left sidebar for global settings + brand essentials
  * - Main area with tabs: Prompt, Brand details, Results
  * - Local persistence to chrome.storage.local (or localStorage in dev)
- * - Backend connectivity check (GET /)
+ * - Backend connectivity check and end-to-end prompt generation
  */
 function App() {
   const [activeTab, setActiveTab] = useState("prompt");
@@ -47,6 +54,15 @@ function App() {
     message: "",
   });
 
+  const [generation, setGeneration] = useState({
+    state: "idle", // idle | generating | ok | err
+    prompt: "",
+    metadata: null,
+    error: "",
+  });
+
+  const [publicConfig, setPublicConfig] = useState(null);
+
   const baseUrl = useMemo(() => resolveBaseUrl(settings), [settings]);
 
   useEffect(() => {
@@ -57,7 +73,8 @@ function App() {
       if (!mounted) return;
 
       // Merge defaults so future fields appear automatically
-      setSettings((prev) => ({ ...prev, ...DEFAULT_SETTINGS, ...stored }));
+      const merged = { ...DEFAULT_SETTINGS, ...stored };
+      setSettings(merged);
       setDirty(false);
     })();
 
@@ -65,6 +82,44 @@ function App() {
       mounted = false;
     };
   }, []);
+
+  // Attempt to pull config/defaults whenever baseUrl changes.
+  // This is best-effort; failures should not break the UI.
+  useEffect(() => {
+    let mounted = true;
+
+    (async () => {
+      try {
+        const cfg = await getPublicConfig(baseUrl);
+        if (!mounted) return;
+        setPublicConfig(cfg);
+      } catch (e) {
+        if (!mounted) return;
+        setPublicConfig(null);
+      }
+
+      try {
+        const defaults = await getDefaultSettings(baseUrl);
+        if (!mounted) return;
+
+        // Only prefill brand name if empty; don't clobber user-entered values.
+        // Defaults provide backend's reasonable baseline, but UI is source of truth.
+        const defaultBrandName = defaults?.brand?.brand_name;
+        if (defaultBrandName) {
+          setSettings((s) => ({
+            ...s,
+            brandName: s.brandName?.trim() ? s.brandName : defaultBrandName,
+          }));
+        }
+      } catch {
+        // ignore
+      }
+    })();
+
+    return () => {
+      mounted = false;
+    };
+  }, [baseUrl]);
 
   async function onSave() {
     await saveSettings(settings);
@@ -94,6 +149,46 @@ function App() {
     }
   }
 
+  async function onGenerate() {
+    setGeneration({ state: "generating", prompt: "", metadata: null, error: "" });
+
+    try {
+      const res = await generatePrompt(baseUrl, settings);
+      setGeneration({
+        state: "ok",
+        prompt: res.prompt,
+        metadata: res.metadata ?? null,
+        error: "",
+      });
+      setActiveTab("results");
+    } catch (e) {
+      setGeneration({
+        state: "err",
+        prompt: "",
+        metadata: null,
+        error:
+          e?.bodyText
+            ? `${e.message}\n\n${e.bodyText}`
+            : e?.message ?? String(e),
+      });
+      setActiveTab("results");
+    }
+  }
+
+  async function onCopyPrompt() {
+    if (!generation.prompt) return;
+
+    try {
+      await navigator.clipboard.writeText(generation.prompt);
+      setApiStatus({ state: "ok", message: "Copied prompt to clipboard." });
+    } catch (e) {
+      setApiStatus({
+        state: "err",
+        message: `Copy failed: ${e?.message ?? String(e)}`,
+      });
+    }
+  }
+
   function patchSettings(patch) {
     setSettings((s) => ({ ...s, ...patch }));
     setDirty(true);
@@ -108,12 +203,16 @@ function App() {
       <span className="badge">Not checked</span>
     );
 
+  const backendVersion = publicConfig?.version ? `v${publicConfig.version}` : null;
+
   return (
     <div className="App">
       <div className="bp-header">
         <div className="bp-brand">
           <div className="bp-title">BrandPrompt Generator</div>
-          <div className="bp-subtitle">On-brand prompt builder</div>
+          <div className="bp-subtitle">
+            On-brand prompt builder {backendVersion ? `• Backend ${backendVersion}` : ""}
+          </div>
         </div>
 
         <div className="bp-status">
@@ -139,7 +238,8 @@ function App() {
               placeholder="http://localhost:3001"
             />
             <div className="hint">
-              Used for API calls. Default is localhost:3001.
+              Used for API calls. Tip: if running in Kavia preview, you may want the same host
+              on port <strong>3001</strong>.
             </div>
           </div>
 
@@ -179,6 +279,9 @@ function App() {
               onChange={(e) => patchSettings({ brandVoice: e.target.value })}
               placeholder="e.g., Clear, confident, helpful"
             />
+            <div className="hint">
+              Used as a human note; backend tone/keywords are derived from other fields.
+            </div>
           </div>
 
           <div className="field">
@@ -227,6 +330,7 @@ function App() {
                         patchSettings({ orientation: e.target.value })
                       }
                     >
+                      {/* Keep current UI labels; apiClient maps to backend enums */}
                       <option>Post</option>
                       <option>Ad</option>
                       <option>Email</option>
@@ -268,6 +372,9 @@ function App() {
                       <option>Conversion</option>
                       <option>Retention</option>
                     </select>
+                    <div className="hint">
+                      Currently informational (not sent to backend yet).
+                    </div>
                   </div>
 
                   <div className="field">
@@ -282,13 +389,16 @@ function App() {
                 </div>
 
                 <div className="field">
-                  <div className="label">Topic</div>
+                  <div className="label">Topic (brief)</div>
                   <input
                     className="input"
                     value={settings.topic}
                     onChange={(e) => patchSettings({ topic: e.target.value })}
                     placeholder="What should the content be about?"
                   />
+                  <div className="hint">
+                    Sent to backend as the required <code>brief</code>.
+                  </div>
                 </div>
 
                 <div className="field">
@@ -301,10 +411,26 @@ function App() {
                   />
                 </div>
 
-                <div className="small-note">
-                  Generation will be enabled once the backend exposes a generate
-                  endpoint. For now you can save settings and verify backend
-                  connectivity.
+                <div className="row">
+                  <button
+                    className="btn"
+                    type="button"
+                    onClick={() => setActiveTab("results")}
+                  >
+                    View results
+                  </button>
+                  <button
+                    className="btn btn-primary"
+                    type="button"
+                    onClick={onGenerate}
+                    disabled={generation.state === "generating"}
+                  >
+                    {generation.state === "generating" ? "Generating..." : "Generate prompt"}
+                  </button>
+                </div>
+
+                <div className="small-note" style={{ marginTop: 10 }}>
+                  This calls <code>POST /prompts/generate</code> and displays the returned prompt in Results.
                 </div>
               </>
             ) : null}
@@ -314,28 +440,42 @@ function App() {
                 <div className="section-title">Brand details</div>
 
                 <div className="field">
-                  <div className="label">Do</div>
+                  <div className="label">Do (style guidance)</div>
                   <textarea
                     className="textarea"
                     value={settings.brandDo}
                     onChange={(e) => patchSettings({ brandDo: e.target.value })}
                     placeholder="Preferred style guidelines..."
                   />
+                  <div className="hint">
+                    Sent to backend as formatting notes.
+                  </div>
                 </div>
 
                 <div className="field">
-                  <div className="label">Don’t</div>
+                  <div className="label">Don’t (things to avoid)</div>
                   <textarea
                     className="textarea"
                     value={settings.brandDont}
                     onChange={(e) => patchSettings({ brandDont: e.target.value })}
                     placeholder="Things to avoid..."
                   />
+                  <div className="hint">
+                    Used to populate backend “avoid” guidance.
+                  </div>
                 </div>
 
-                <div className="small-note">
-                  These values are stored locally in the extension and can be sent
-                  to the backend once prompt generation is implemented.
+                <div className="row">
+                  <button className="btn" type="button" onClick={onSave} disabled={!dirty}>
+                    Save settings
+                  </button>
+                  <button className="btn btn-primary" type="button" onClick={onGenerate} disabled={generation.state === "generating"}>
+                    {generation.state === "generating" ? "Generating..." : "Generate prompt"}
+                  </button>
+                </div>
+
+                <div className="small-note" style={{ marginTop: 10 }}>
+                  These values are stored locally and also sent to the backend during generation.
                 </div>
               </>
             ) : null}
@@ -343,24 +483,70 @@ function App() {
             {activeTab === "results" ? (
               <>
                 <div className="section-title">Results</div>
-                <div className="results" role="region" aria-label="Generated prompt">
-                  {`No generated prompt yet.
 
-Current configuration snapshot:
-- Brand: ${settings.brandName || "(not set)"}
-- Voice: ${settings.brandVoice || "(not set)"}
-- Orientation: ${settings.orientation}
-- Platform: ${settings.platform}
-- Objective: ${settings.objective}
-- Topic: ${settings.topic || "(not set)"}
+                {generation.state === "idle" ? (
+                  <>
+                    <div className="results" role="region" aria-label="Generated prompt">
+                      {`No generated prompt yet.
 
-Next step: backend needs a generation endpoint; UI wiring is ready.`}
-                </div>
+Fill out Brand name + Topic, then click "Generate prompt".`}
+                    </div>
 
-                <div className="small-note" style={{ marginTop: 10 }}>
-                  Once the backend has a generate endpoint, this tab will show the
-                  returned prompt(s) and allow copy-to-clipboard.
-                </div>
+                    <div className="small-note" style={{ marginTop: 10 }}>
+                      The backend returns a ready-to-use prompt you can paste into an LLM.
+                    </div>
+                  </>
+                ) : null}
+
+                {generation.state === "generating" ? (
+                  <>
+                    <div className="results" role="region" aria-label="Generated prompt">
+                      Generating prompt...
+                    </div>
+                    <div className="small-note" style={{ marginTop: 10 }}>
+                      Calling <code>POST /prompts/generate</code> on {baseUrl}
+                    </div>
+                  </>
+                ) : null}
+
+                {generation.state === "err" ? (
+                  <>
+                    <div className="results" role="region" aria-label="Generated prompt">
+                      {`Generation failed.
+
+${generation.error}`}
+                    </div>
+                    <div className="small-note" style={{ marginTop: 10 }}>
+                      Tip: click “Check backend” and verify the Backend URL.
+                    </div>
+                  </>
+                ) : null}
+
+                {generation.state === "ok" ? (
+                  <>
+                    <div className="results" role="region" aria-label="Generated prompt">
+                      {generation.prompt}
+                    </div>
+
+                    <div className="bp-actions" style={{ paddingLeft: 0, paddingRight: 0 }}>
+                      <button className="btn" type="button" onClick={onCopyPrompt} disabled={!generation.prompt}>
+                        Copy prompt
+                      </button>
+                      <button className="btn btn-primary" type="button" onClick={onGenerate} disabled={generation.state === "generating"}>
+                        Regenerate
+                      </button>
+                    </div>
+
+                    <div className="small-note" style={{ marginTop: 10 }}>
+                      {generation.metadata ? "Metadata returned (for debugging):" : null}
+                    </div>
+                    {generation.metadata ? (
+                      <pre className="small-note" style={{ whiteSpace: "pre-wrap", marginTop: 6 }}>
+                        {JSON.stringify(generation.metadata, null, 2)}
+                      </pre>
+                    ) : null}
+                  </>
+                ) : null}
               </>
             ) : null}
           </section>
@@ -368,6 +554,9 @@ Next step: backend needs a generation endpoint; UI wiring is ready.`}
           <div className="bp-actions">
             <button className="btn" type="button" onClick={() => setActiveTab("results")}>
               View results
+            </button>
+            <button className="btn" type="button" onClick={onGenerate} disabled={generation.state === "generating"}>
+              {generation.state === "generating" ? "Generating..." : "Generate"}
             </button>
             <button className="btn btn-primary" type="button" onClick={onSave} disabled={!dirty}>
               Save settings
